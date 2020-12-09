@@ -97,7 +97,7 @@ inline void set_bm(unsigned long bit, struct scan_bitmap *bm,
 	}
 }
 
-static inline int get_cpuid(struct nova_sb_info *sbi, unsigned long blocknr)
+inline int get_cpuid(struct nova_sb_info *sbi, unsigned long blocknr)
 {
 	return blocknr / sbi->per_list_blocks;
 }
@@ -471,6 +471,18 @@ static u64 nova_save_range_nodes_to_log(struct super_block *sb,
 		nova_free_range_node(curr);
 	}
 
+	return temp_tail;
+}
+
+static u64 nova_save_bdev_free_list_blocknodes(struct super_block *sb, int index,
+	u64 temp_tail)
+{
+	struct nova_sb_info *sbi = NOVA_SB(sb);
+	struct bdev_free_list *bfl;
+
+ 	bfl = nova_get_bdev_free_list_flat(sbi, index);
+	temp_tail = nova_save_range_nodes_to_log(sb,
+				&bfl->block_free_tree, temp_tail, 0);
 	return temp_tail;
 }
 

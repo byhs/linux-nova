@@ -675,7 +675,7 @@ long nova_alloc_blocks_in_free_list(struct super_block *sb,
 			break;
 		}
 		
-parital:
+partial:
 		/* Allocate partial blocknode */
 		if (from_tail == ALLOC_FROM_HEAD) {
 			*new_blocknr = curr->range_low;
@@ -926,6 +926,7 @@ unsigned long nova_count_free_blocks(struct super_block *sb)
 {
 	struct nova_sb_info *sbi = NOVA_SB(sb);
 	struct free_list *free_list;
+	struct bdev_free_list *bfl;
 	unsigned long num_free_blocks = 0;
 	int i, j;
 

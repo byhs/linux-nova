@@ -314,6 +314,7 @@ enum {
 	Opt_bpi, Opt_init, Opt_snapshot, Opt_mode, Opt_uid,
 	Opt_gid, Opt_blocksize, Opt_wprotect, Opt_bdev, Opt_bsize, Opt_osb,
 	Opt_syncb, Opt_seqb, Opt_psize, Opt_vsize,
+	Opt_err_cont, Opt_err_panic, Opt_err_ro,
 	Opt_dbgmask, Opt_err
 };
 
