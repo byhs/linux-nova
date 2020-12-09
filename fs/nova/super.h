@@ -161,6 +161,30 @@ struct nova_sb_info {
 	u32 zero_csum[8];
 	void *zero_parity;
 
+
+ 	/* VPMEM */
+	void *vpmem;
+	unsigned long vpmem_num_blocks;
+	atomic_t *pgcache_size;
+	struct mutex *vpmem_lru_mutex;
+	struct mutex *vpmem_wb_mutex;
+	struct mutex *vpmem_evict_mutex;
+	struct mutex *vpmem_rb_mutex;
+	struct list_head *vpmem_lru_list;
+	struct list_head *vpmem_wb_list;
+	struct list_head *vpmem_evict_list;
+	struct rb_root *vpmem_rb_tree;
+	struct nova_kthread *wb_thread;
+
+ 	/* Block device buffer */
+	char *bdev_buffer;
+	struct mutex bb_mutex;
+	struct page **bb_pages;
+
+ 	/* Bio list */ 
+	spinlock_t bal_lock;
+	struct bio_async_list *bal_head;
+
 	/* Per-CPU journal lock */
 	spinlock_t *journal_locks;
 
@@ -172,6 +196,23 @@ struct nova_sb_info {
 
 	/* Per-CPU free block list */
 	struct free_list *free_lists;
+
+	/* NOVA-tiering */
+	struct bdev_info *bdev_list;
+
+ 	struct tiering_stat *stat;
+
+ 	/* Background migration thread */
+	struct nova_kthread *bm_thread;	
+	struct nova_kthread *usage_thread;	
+
+ 	/* Free block list for block devices */
+	struct bdev_free_list *bdev_free_list;
+
+ 	/* LRU list of the profiler */
+	struct mutex *il_mutex;
+	struct list_head *inode_lru_lists;
+	
 	unsigned long per_list_blocks;
 };
 

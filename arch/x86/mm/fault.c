@@ -1298,6 +1298,10 @@ __do_page_fault(struct pt_regs *regs, unsigned long error_code,
 	 */
 	if (unlikely(fault_in_kernel_space(address))) {
 		if (!(error_code & (PF_RSVD | PF_USER | PF_PROT))) {
+			if(vpmem_operations.do_page_fault)
+				if(vpmem_operations.do_page_fault(regs, error_code, address))
+					return;
+
 			if (vmalloc_fault(address) >= 0)
 				return;
 
@@ -1518,6 +1522,7 @@ do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	prev_state = exception_enter();
 	__do_page_fault(regs, error_code, address);
 	exception_exit(prev_state);
+	if(vpmem_operations.do_checkout) vpmem_operations.do_checkout(address);
 }
 NOKPROBE_SYMBOL(do_page_fault);
 
@@ -1548,6 +1553,7 @@ trace_do_page_fault(struct pt_regs *regs, unsigned long error_code)
 	trace_page_fault_entries(address, regs, error_code);
 	__do_page_fault(regs, error_code, address);
 	exception_exit(prev_state);
+	if(vpmem_operations.do_checkout) vpmem_operations.do_checkout(address);
 }
 NOKPROBE_SYMBOL(trace_do_page_fault);
 #endif /* CONFIG_TRACING */

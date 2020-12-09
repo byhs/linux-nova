@@ -35,6 +35,10 @@ static inline int nova_copy_partial_block(struct super_block *sb,
 	nvmm = get_nvmm(sb, sih, entry, index);
 	ptr = nova_get_block(sb, (nvmm << PAGE_SHIFT));
 
+	if (vpmem_valid_address((unsigned long)ptr)) {
+		vpmem_do_page_fault_range((unsigned long)ptr, (unsigned long)ptr, 1);
+	}
+
 	if (ptr != NULL) {
 		if (support_clwb)
 			rc = memcpy_mcsafe(kmem + offset, ptr + offset,
@@ -118,6 +122,9 @@ int nova_handle_head_tail_blocks(struct super_block *sb,
 		entry = nova_get_write_entry(sb, sih, start_blk);
 		ret = nova_handle_partial_block(sb, sih, entry,
 						start_blk, 0, offset, kmem);
+		if (entry)
+			put_write_entry(entry);
+
 		if (ret < 0)
 			return ret;
 	}
@@ -134,6 +141,9 @@ int nova_handle_head_tail_blocks(struct super_block *sb,
 						eblk_offset,
 						sb->s_blocksize - eblk_offset,
 						kmem);
+		if (entry)
+			put_write_entry(entry);
+
 		if (ret < 0)
 			return ret;
 	}
@@ -143,7 +153,7 @@ int nova_handle_head_tail_blocks(struct super_block *sb,
 }
 
 int nova_reassign_file_tree(struct super_block *sb,
-	struct nova_inode_info_header *sih, u64 begin_tail)
+	struct nova_inode_info_header *sih, u64 begin_tail, bool free)
 {
 	void *addr;
 	struct nova_file_write_entry *entry;
@@ -178,7 +188,7 @@ int nova_reassign_file_tree(struct super_block *sb,
 			continue;
 		}
 
-		nova_assign_write_entry(sb, sih, entry, entryc, true);
+		nova_assign_write_entry(sb, sih, entry, entryc, free);
 		curr_p += entry_size;
 	}
 
@@ -259,7 +269,7 @@ void nova_init_file_write_entry(struct super_block *sb,
 	entry->block = cpu_to_le64(nova_get_block_off(sb, blocknr,
 							sih->i_blk_type));
 	entry->mtime = cpu_to_le32(time);
-
+	entry->counter = 0;
 	entry->size = file_size;
 }
 
@@ -311,7 +321,7 @@ int nova_protect_file_data(struct super_block *sb, struct inode *inode,
 
 	if (offset != 0) {
 		NOVA_STATS_ADD(protect_head, 1);
-		entry = nova_get_write_entry(sb, sih, start_blk);
+		entry = nova_get_write_entry_lockfree(sb, sih, start_blk);
 		if (entry != NULL) {
 			if (metadata_csum == 0)
 				entryc = entry;
@@ -380,7 +390,7 @@ eblk:
 
 	if (eblk_offset != 0) {
 		NOVA_STATS_ADD(protect_tail, 1);
-		entry = nova_get_write_entry(sb, sih, end_blk);
+		entry = nova_get_write_entry_lockfree(sb, sih, end_blk);
 		if (entry != NULL) {
 			if (metadata_csum == 0)
 				entryc = entry;
@@ -776,7 +786,7 @@ ssize_t do_nova_inplace_file_write(struct file *filp,
 		NOVA_STATS_ADD(inplace_new_blocks, 1);
 
 		/* Update file tree */
-		ret = nova_reassign_file_tree(sb, sih, begin_tail);
+		ret = nova_reassign_file_tree(sb, sih, begin_tail, true);
 		if (ret)
 			goto out;
 	}
@@ -849,7 +859,7 @@ int nova_check_overlap_vmas(struct super_block *sb,
 					num_pages, &start_pgoff, &num);
 		if (ret) {
 			for (i = 0; i < num; i++) {
-				if (nova_get_write_entry(sb, sih,
+				if (nova_get_write_entry_lockfree(sb, sih,
 							start_pgoff + i))
 					return 1;
 			}
@@ -916,8 +926,10 @@ again:
 			nvmm = get_nvmm(sb, sih, entryc, iblock);
 			nova_dbgv("%s: found pgoff %lu, block %lu\n",
 					__func__, iblock, nvmm);
+			put_write_entry(entry);
 			goto out;
 		}
+		put_write_entry(entry);
 	}
 
 	if (create == 0) {
@@ -972,7 +984,7 @@ again:
 	nova_update_inode(sb, inode, pi, &update, 1);
 	nova_memlock_inode(sb, pi);
 
-	ret = nova_reassign_file_tree(sb, sih, update.curr_entry);
+	ret = nova_reassign_file_tree(sb, sih, update.curr_entry, true);
 	if (ret) {
 		nova_dbgv("%s: nova_reassign_file_tree failed: %d\n",
 			  __func__,  ret);
@@ -1185,7 +1197,14 @@ int nova_insert_write_vma(struct vm_area_struct *vma)
 	int compVal;
 	int insert = 0;
 	int ret;
+	pgoff_t index = cpu_to_le64(vma->vm_pgoff);
+	pgoff_t end_index = index + cpu_to_le64((vma->vm_end - vma->vm_start) >> PAGE_SHIFT) - 1;
 	timing_t insert_vma_time;
+
+ 	#ifdef DEBUG_FILE_OP
+		nova_info("[Mmap] IN index %lu end_index %lu \n", index, end_index);
+	#endif
+	migrate_a_file_to_pmem_partial(inode, index, end_index, true);
 
 
 	if ((vma->vm_flags & flags) != flags)
@@ -1250,6 +1269,9 @@ out:
 	}
 
 	NOVA_END_TIMING(insert_vma_t, insert_vma_time);
+	#ifdef DEBUG_FILE_OP
+		nova_info("[Mmap] OUT index %lu end_index %lu \n", index, end_index);
+	#endif
 	return ret;
 }
 
@@ -1338,6 +1360,10 @@ static void nova_vma_open(struct vm_area_struct *vma)
 	struct address_space *mapping = vma->vm_file->f_mapping;
 	struct inode *inode = mapping->host;
 
+	#ifdef DEBUG_FILE_OP
+		nova_info("[Mmap open] IN ino %lu\n", inode->i_ino);
+	#endif
+
 	nova_dbg_mmap4k("[%s:%d] inode %lu, MMAP 4KPAGE vm_start(0x%lx), vm_end(0x%lx), vm pgoff %lu, %lu blocks, vm_flags(0x%lx), vm_page_prot(0x%lx)\n",
 			__func__, __LINE__,
 			inode->i_ino, vma->vm_start, vma->vm_end,
@@ -1347,16 +1373,26 @@ static void nova_vma_open(struct vm_area_struct *vma)
 			pgprot_val(vma->vm_page_prot));
 
 	nova_insert_write_vma(vma);
+	#ifdef DEBUG_FILE_OP
+		nova_info("[Mmap open] OUT ino %lu\n", inode->i_ino);
+	#endif
 }
 
 static void nova_vma_close(struct vm_area_struct *vma)
 {
+	#ifdef DEBUG_FILE_OP
+		nova_info("[Mmap close] IN\n");
+	#endif
+
 	nova_dbgv("[%s:%d] MMAP 4KPAGE vm_start(0x%lx), vm_end(0x%lx), vm_flags(0x%lx), vm_page_prot(0x%lx)\n",
 		  __func__, __LINE__, vma->vm_start, vma->vm_end,
 		  vma->vm_flags, pgprot_val(vma->vm_page_prot));
 
-	vma->original_write = 0;
+	//vma->original_write = 0;
 	nova_remove_write_vma(vma);
+	#ifdef DEBUG_FILE_OP
+		nova_info("[Mmap close] OUT\n");
+	#endif
 }
 
 const struct vm_operations_struct nova_dax_vm_ops = {

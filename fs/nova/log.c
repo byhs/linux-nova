@@ -101,7 +101,7 @@ int nova_reassign_logentry(struct super_block *sb, void *entry,
 	return nova_invalidate_reassign_logentry(sb, entry, type, 1, 0);
 }
 
-static inline int nova_invalidate_write_entry(struct super_block *sb,
+inline int nova_invalidate_write_entry(struct super_block *sb,
 	struct nova_file_write_entry *entry, int reassign,
 	unsigned int num_free)
 {
@@ -164,7 +164,13 @@ unsigned int nova_free_old_entry(struct super_block *sb,
 
 	nova_dbgv("%s: pgoff %lu, free %u blocks\n",
 				__func__, pgoff, num_free);
-	nova_free_data_blocks(sb, sih, old_nvmm, num_free);
+	//nova_free_data_blocks(sb, sih, old_nvmm, num_free);
+	if (nova_free_data_blocks(sb, sih, old_nvmm, num_free)) {
+		#ifdef DEBUG_MIGRATION_FREE
+			nova_info("old_nvmm %lu num_free %u\n", old_nvmm, num_free);
+			print_a_write_entry(sb, entry, 0);
+		#endif
+	}
 
 out:
 	sih->i_blocks -= num_free;
@@ -174,6 +180,46 @@ out:
 }
 
 struct nova_file_write_entry *nova_find_next_entry(struct super_block *sb,
+	struct nova_inode_info_header *sih, pgoff_t pgoff)
+{
+	struct nova_file_write_entry *entry;
+	void **entryp = NULL;
+	int nr_entries;
+
+ 	rcu_read_lock();
+repeat:
+	entry = NULL;
+	nr_entries = radix_tree_gang_lookup_slot(&sih->tree,
+					&entryp, NULL, pgoff, 1);
+	if (!entryp)
+		goto out;
+
+ 	entry = radix_tree_deref_slot(entryp);
+	if (unlikely(!entry))
+		goto out;
+
+ 	if (radix_tree_exception(entry)) {
+		if (radix_tree_deref_retry(entry))
+			goto repeat;
+
+ 		entry = NULL;
+		goto out;
+	}
+
+ 	if (!get_write_entry(entry))
+		goto repeat;
+
+ 	if (unlikely(entry != *entryp)) {
+		put_write_entry(entry);
+		goto repeat;
+	}
+
+ out:
+	rcu_read_unlock();
+	return entry;
+}
+
+struct nova_file_write_entry *nova_find_next_entry_lockfree(struct super_block *sb,
 	struct nova_inode_info_header *sih, pgoff_t pgoff)
 {
 	struct nova_file_write_entry *entry = NULL;
@@ -198,9 +244,10 @@ void nova_clear_last_page_tail(struct super_block *sb,
 	struct nova_sb_info *sbi = NOVA_SB(sb);
 	struct nova_inode_info *si = NOVA_I(inode);
 	struct nova_inode_info_header *sih = &si->header;
+	struct nova_file_write_entry *entry;
 	unsigned long offset = newsize & (sb->s_blocksize - 1);
 	unsigned long pgoff, length;
-	u64 nvmm;
+	unsigned long nvmm;
 	char *nvmm_addr;
 
 	if (offset == 0 || newsize > inode->i_size)
@@ -209,19 +256,16 @@ void nova_clear_last_page_tail(struct super_block *sb,
 	length = sb->s_blocksize - offset;
 	pgoff = newsize >> sb->s_blocksize_bits;
 
-	nvmm = nova_find_nvmm_block(sb, sih, NULL, pgoff);
-	if (nvmm == 0)
+	entry = nova_get_write_entry(sb, sih, pgoff);
+	if (!entry)
 		return;
 
-	nvmm_addr = (char *)nova_get_block(sb, nvmm);
+	nvmm = get_nvmm(sb, sih, entry, pgoff);
+	nvmm_addr = (char *)nova_get_block(sb, nvmm << PAGE_SHIFT);
 	nova_memunlock_range(sb, nvmm_addr + offset, length);
 	memcpy_to_pmem_nocache(nvmm_addr + offset, sbi->zeroed_page, length);
 	nova_memlock_range(sb, nvmm_addr + offset, length);
-
-	if (data_csum > 0)
-		nova_update_truncated_block_csum(sb, inode, newsize);
-	if (data_parity > 0)
-		nova_update_truncated_block_parity(sb, inode, newsize);
+	put_write_entry(entry);
 }
 
 static void nova_update_setattr_entry(struct inode *inode,
@@ -823,8 +867,9 @@ int nova_assign_write_entry(struct super_block *sb,
 			} else {
 				num_free++;
 			}
-
+			lock_write_entry(old_entry);
 			radix_tree_replace_slot(&sih->tree, pentry, entry);
+			unlock_write_entry(old_entry);
 		} else {
 			ret = radix_tree_insert(&sih->tree, curr_pgoff, entry);
 			if (ret) {
@@ -1139,6 +1184,61 @@ int nova_allocate_inode_log_pages(struct super_block *sb,
 						NOVA_BLOCK_TYPE_4K);
 
 	return ret_pages;
+}
+
+/* Log block resides in NVMM */
+int nova_allocate_inode_log_pages_from_bdev(struct super_block *sb,
+	struct nova_inode_info_header *sih, unsigned long num_pages,
+	u64 *new_block, int cpuid, enum nova_alloc_direction from_tail)
+{
+	unsigned long new_inode_blocknr;
+	unsigned long first_blocknr;
+	unsigned long prev_blocknr;
+	int allocated;
+	int ret_pages = 0;
+
+ 	allocated = nova_new_blocks_from_bdev(sb, TIER_BDEV_LOW, &new_inode_blocknr, 
+			num_pages, cpuid, from_tail, false);
+
+ 	if (allocated <= 0) {
+		nova_err(sb, "ERROR: no inode log page available: %d %d\n",
+			num_pages, allocated);
+		return allocated;
+	}
+	ret_pages += allocated;
+	num_pages -= allocated;
+	nova_dbg_verbose("Pi %lu: Alloc %d log blocks @ 0x%lx\n",
+			sih->ino, allocated, new_inode_blocknr);
+
+ 	/* Coalesce the pages */
+	nova_coalesce_log_pages(sb, 0, new_inode_blocknr, allocated);
+	first_blocknr = new_inode_blocknr;
+	prev_blocknr = new_inode_blocknr + allocated - 1;
+
+ 	/* Allocate remaining pages */
+	while (num_pages) {
+		allocated = nova_new_blocks_from_bdev(sb, TIER_BDEV_LOW, &new_inode_blocknr, 
+			num_pages, cpuid, from_tail, false);
+
+ 		nova_dbg_verbose("Alloc %d log blocks @ 0x%lx\n",
+					allocated, new_inode_blocknr);
+		if (allocated <= 0) {
+			nova_dbg("%s: no inode log page available: %lu %d\n",
+				__func__, num_pages, allocated);
+			/* Return whatever we have */
+			break;
+		}
+		ret_pages += allocated;
+		num_pages -= allocated;
+		nova_coalesce_log_pages(sb, prev_blocknr, new_inode_blocknr,
+						allocated);
+		prev_blocknr = new_inode_blocknr + allocated - 1;
+	}
+
+ 	*new_block = nova_get_block_off(sb, first_blocknr,
+						NOVA_BLOCK_TYPE_4K);
+
+ 	return ret_pages;
 }
 
 static int nova_initialize_inode_log(struct super_block *sb,
