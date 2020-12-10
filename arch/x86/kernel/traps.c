@@ -86,12 +86,6 @@ struct vpmem_operations vpmem_operations = {
 };
 EXPORT_SYMBOL(vpmem_operations);
 
- /* Must be page-aligned because the real IDT is used in a fixmap. */
-gate_desc idt_table[NR_VECTORS] __page_aligned_bss;
-
-DECLARE_BITMAP(used_vectors, NR_VECTORS);
-EXPORT_SYMBOL_GPL(used_vectors);
-
 /* Must be page-aligned because the real IDT is used in a fixmap. */
 gate_desc idt_table[NR_VECTORS] __page_aligned_bss;
 
